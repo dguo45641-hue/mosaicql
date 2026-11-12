@@ -1,0 +1,295 @@
+options {
+  STATIC = false;
+  JAVA_UNICODE_ESCAPE = false;
+  UNICODE_INPUT = true;
+  JDK_VERSION = "21";
+}
+
+PARSER_BEGIN(MosaicQLParser)
+package com.mosaicql;
+
+import com.mosaicql.ast.Ast;
+import java.io.StringReader;
+import java.math.BigDecimal;
+import java.util.ArrayList;
+import java.util.List;
+
+public class MosaicQLParser {
+  public Ast.Query parse() throws ParseException { return Query(); }
+
+  public static Ast.Query parse(String text) throws ParseException {
+    return new MosaicQLParser(new StringReader(text)).parse();
+  }
+
+  private static String unquote(String text) {
+    StringBuilder result = new StringBuilder();
+    for (int i = 1; i < text.length() - 1; i++) {
+      char c = text.charAt(i);
+      if (c != '\\') {
+        result.append(c);
+        continue;
+      }
+      char escape = text.charAt(++i);
+      switch (escape) {
+        case '"': case '\\': case '/': result.append(escape); break;
+        case 'b': result.append('\b'); break;
+        case 'f': result.append('\f'); break;
+        case 'n': result.append('\n'); break;
+        case 'r': result.append('\r'); break;
+        case 't': result.append('\t'); break;
+        case 'u':
+          result.append((char) Integer.parseInt(text.substring(i + 1, i + 5), 16));
+          i += 4;
+          break;
+        default: throw new IllegalArgumentException("Invalid string escape");
+      }
+    }
+    return result.toString();
+  }
+}
+PARSER_END(MosaicQLParser)
+
+SKIP : {
+    " " | "\t" | "\r" | "\n"
+  | <LINE_COMMENT: "//" (~["\r", "\n"])*>
+}
+
+TOKEN : {
+    <AS: "as"> | <JOIN: "join"> | <LEFT: "left"> | <RIGHT: "right"> | <INNER: "inner"> | <OUTER: "outer">
+  | <ON: "on"> | <WHERE: "where">
+  | <AND: "and"> | <OR: "or"> | <GROUP: "group"> | <BY: "by">
+  | <ORDER: "order"> | <ASC: "asc"> | <DESC: "desc"> | <LIMIT: "limit">
+  | <TRUE: "true"> | <FALSE: "false"> | <NULL: "null">
+  | <CASE: "case"> | <WHEN: "when"> | <THEN: "then"> | <ELSE: "else"> | <END: "end">
+  | <IF: "if"> | <FI: "fi">
+  | <#HEX: ["0"-"9", "a"-"f", "A"-"F"]>
+  | <STRING: "\"" (
+        ~["\"", "\\", "\u0000"-"\u001f"]
+      | "\\" (["\"", "\\", "/", "b", "f", "n", "r", "t"] | "u" <HEX> <HEX> <HEX> <HEX>)
+    )* "\"">
+  | <NUMBER: (["0"-"9"])+ ("." (["0"-"9"])+)?>
+  | <IDENTIFIER: ["a"-"z", "A"-"Z", "_"] (["a"-"z", "A"-"Z", "0"-"9", "_"])*>
+  | <EQ: "="> | <NE: "!="> | <LE: "<="> | <GE: ">=">
+  | <LT: "<"> | <GT: ">"> | <PLUS: "+"> | <MINUS: "-">
+  | <STAR: "*"> | <SLASH: "/"> | <LPAREN: "("> | <RPAREN: ")">
+  | <LBRACE: "{"> | <RBRACE: "}"> | <COMMA: ","> | <COLON: ":"> | <DOT: ".">
+  | <LBRACKET: "["> | <RBRACKET: "]">
+}
+
+Ast.Query Query() :
+{ Ast.Query query; }
+{
+  query = NestedQuery(false) <EOF> { return query; }
+}
+
+Ast.Query NestedQuery(boolean nested) :
+{ Ast.Source source; Ast.Join join; List<Ast.Join> joins = new ArrayList<>(); Ast.Projection projection; Ast.Expr where = null; List<Ast.Expr> groupBy = new ArrayList<>(); List<Ast.Order> orderBy = new ArrayList<>(); Integer limit = null; Ast.ResultShape shape = Ast.ResultShape.OBJECT; }
+{
+  source = Source()
+  ( join = JoinClause() { joins.add(join); } )*
+  ( <LBRACKET> projection = Projection() <RBRACKET> { shape = Ast.ResultShape.ARRAY; }
+  | projection = Projection() )
+  [ <WHERE> where = OrExpression() ]
+  [ <GROUP> <BY> groupBy = GroupBy() ]
+  [ <ORDER> <BY> orderBy = OrderBy(nested) ]
+  [ <LIMIT> limit = Limit() ]
+  { return new Ast.Query(source, joins, projection, where, groupBy, orderBy, limit, shape); }
+}
+
+Ast.Source Source() :
+{ Token name; Token part; Token alias; String qualifier = null; List<String> path = new ArrayList<>(); }
+{
+  name = Identifier()
+  ( <DOT> part = Identifier() { path.add(part.image); } )*
+  [ ( <AS> alias = Identifier() { qualifier = alias.image; } )
+  | ( <LPAREN> alias = Identifier() <RPAREN> { qualifier = alias.image; } ) ]
+  { return new Ast.Source(name.image, path, qualifier); }
+}
+
+Ast.Join JoinClause() :
+{ Ast.Source source; Ast.Expr on; Ast.JoinType type = Ast.JoinType.INNER; }
+{
+  [ <LEFT> [ <OUTER> ] { type = Ast.JoinType.LEFT; }
+  | <RIGHT> [ <OUTER> ] { type = Ast.JoinType.RIGHT; }
+  | <INNER> ]
+  <JOIN> source = Source() <ON> on = OrExpression()
+  { return new Ast.Join(type, source, on); }
+}
+
+Ast.Projection Projection() :
+{ List<Ast.Field> fields = new ArrayList<>(); Ast.Field field; }
+{
+  <LBRACE>
+  [ field = Field() { fields.add(field); }
+    ( LOOKAHEAD(2) <COMMA> field = Field() { fields.add(field); } )*
+    [ <COMMA> ]
+  ]
+  <RBRACE>
+  { return new Ast.Projection(fields); }
+}
+
+List<Ast.Expr> GroupBy() :
+{ List<Ast.Expr> expressions = new ArrayList<>(); Ast.Expr expression; }
+{
+  (
+    <LPAREN> expression = OrExpression() { expressions.add(expression); }
+    ( <COMMA> expression = OrExpression() { expressions.add(expression); } )*
+    <RPAREN>
+  | expression = Reference() { expressions.add(expression); }
+  )
+  { return expressions; }
+}
+
+List<Ast.Order> OrderBy(boolean nested) :
+{ List<Ast.Order> orders = new ArrayList<>(); Ast.Order order; }
+{
+  (
+    LOOKAHEAD(<LPAREN>)
+    <LPAREN> order = OrderTerm() { orders.add(order); }
+      ( <COMMA> order = OrderTerm() { orders.add(order); } )*
+    <RPAREN>
+  | order = OrderTerm() { orders.add(order); }
+    ( LOOKAHEAD({ !nested && getToken(1).kind == COMMA })
+      <COMMA> order = OrderTerm() { orders.add(order); } )*
+  )
+  { return orders; }
+}
+
+Ast.Order OrderTerm() :
+{ Ast.Expr expression; Token direction = null; }
+{
+  expression = OrExpression() [ direction = <ASC> | direction = <DESC> ]
+  { return new Ast.Order(expression, direction != null && direction.kind == DESC); }
+}
+
+Integer Limit() : { Token number; }
+{
+  number = <NUMBER>
+  {
+    try {
+      if (number.image.indexOf('.') >= 0) throw new NumberFormatException();
+      return Integer.valueOf(number.image);
+    } catch (NumberFormatException error) {
+      throw new ParseException("limit must be an integer from 0 to 2147483647 at line "
+          + number.beginLine + ", column " + number.beginColumn);
+    }
+  }
+}
+
+Ast.Field Field() :
+{ Token key; Ast.Expr value; Ast.Reference reference; }
+{
+    key = <STRING> <COLON> value = Expression()
+      { return new Ast.Field(unquote(key.image), value); }
+  | LOOKAHEAD(Identifier() <COLON>) key = Identifier() <COLON> value = Expression()
+      { return new Ast.Field(key.image, value); }
+  | <STAR> { return new Ast.Field("*", new Ast.Wildcard()); }
+  | reference = Reference()
+      { return new Ast.Field(reference.name(), reference); }
+}
+
+// A bare query consumes a complete value. Parentheses delimit queries used as operands.
+Ast.Expr Expression() :
+{ Ast.Query query; Ast.Expr expression; }
+{
+    LOOKAHEAD(Source() ( <JOIN> | <LEFT> | <RIGHT> | <INNER> | <LBRACE> | <LBRACKET> ))
+    query = NestedQuery(true) { return new Ast.NestedQuery(query); }
+  | expression = OrExpression() { return expression; }
+}
+
+Ast.Expr OrExpression() :
+{ Ast.Expr left, right; }
+{
+  left = AndExpression()
+  ( <OR> right = AndExpression() { left = new Ast.Binary("or", left, right); } )*
+  { return left; }
+}
+
+Ast.Expr AndExpression() :
+{ Ast.Expr left, right; }
+{
+  left = EqualityExpression()
+  ( <AND> right = EqualityExpression() { left = new Ast.Binary("and", left, right); } )*
+  { return left; }
+}
+
+Ast.Expr EqualityExpression() :
+{ Ast.Expr left, right; Token op; }
+{
+  left = RelationalExpression()
+  ( (op = <EQ> | op = <NE>) right = RelationalExpression() { left = new Ast.Binary(op.image, left, right); } )*
+  { return left; }
+}
+
+Ast.Expr RelationalExpression() :
+{ Ast.Expr left, right; Token op; }
+{
+  left = AdditiveExpression()
+  ( (op = <LE> | op = <GE> | op = <LT> | op = <GT>) right = AdditiveExpression()
+    { left = new Ast.Binary(op.image, left, right); } )*
+  { return left; }
+}
+
+Ast.Expr AdditiveExpression() :
+{ Ast.Expr left, right; Token op; }
+{
+  left = MultiplicativeExpression()
+  ( (op = <PLUS> | op = <MINUS>) right = MultiplicativeExpression()
+    { left = new Ast.Binary(op.image, left, right); } )*
+  { return left; }
+}
+
+Ast.Expr MultiplicativeExpression() :
+{ Ast.Expr left, right; Token op; }
+{
+  left = UnaryExpression()
+  ( (op = <STAR> | op = <SLASH>) right = UnaryExpression()
+    { left = new Ast.Binary(op.image, left, right); } )*
+  { return left; }
+}
+
+Ast.Expr UnaryExpression() :
+{ Ast.Expr expression; }
+{
+    <MINUS> expression = UnaryExpression() { return new Ast.Unary("-", expression); }
+  | expression = PrimaryExpression() { return expression; }
+}
+
+Ast.Expr PrimaryExpression() :
+{ Token token; Ast.Expr expression; List<Ast.Expr> args = new ArrayList<>(); List<Ast.When> branches = new ArrayList<>(); Ast.Expr elseValue = null; Ast.Expr condition; Ast.Expr value; }
+{
+    <CASE> ( <WHEN> condition = OrExpression() <THEN> value = Expression() { branches.add(new Ast.When(condition, value)); } )+
+      [ <ELSE> elseValue = Expression() ] <END> { return new Ast.CaseWhen(branches, elseValue); }
+  | <IF> condition = OrExpression() <THEN> value = Expression() { branches.add(new Ast.When(condition, value)); }
+      ( LOOKAHEAD(<ELSE> <IF>) <ELSE> <IF> condition = OrExpression() <THEN> value = Expression() { branches.add(new Ast.When(condition, value)); } )*
+      [ <ELSE> elseValue = Expression() ] <FI> { return new Ast.CaseWhen(branches, elseValue); }
+  | token = <STRING> { return new Ast.Literal(unquote(token.image)); }
+  | token = <NUMBER> { return new Ast.Literal(new BigDecimal(token.image)); }
+  | <TRUE> { return new Ast.Literal(true); }
+  | <FALSE> { return new Ast.Literal(false); }
+  | <NULL> { return new Ast.Literal(null); }
+  | LOOKAHEAD(Identifier() <LPAREN>) token = Identifier() <LPAREN>
+      [ <STAR> { args.add(new Ast.Wildcard()); }
+      | expression = Expression() { args.add(expression); }
+        ( <COMMA> expression = Expression() { args.add(expression); } )* ]
+      <RPAREN> { return new Ast.Function(token.image, args); }
+  | expression = Reference() { return expression; }
+  | <LPAREN> expression = Expression() <RPAREN> { return expression; }
+}
+
+Ast.Reference Reference() :
+{ Token first; Token part; List<String> path = new ArrayList<>(); }
+{
+  first = Identifier()
+  ( <DOT> part = Identifier() { path.add(part.image); } )*
+  {
+    if (path.isEmpty()) return new Ast.Reference(null, List.of(first.image));
+    return new Ast.Reference(first.image, path);
+  }
+}
+
+Token Identifier() : { Token token; }
+{
+  ( token = <IDENTIFIER> | token = <LEFT> | token = <RIGHT> | token = <INNER> | token = <OUTER> )
+  { return token; }
+}

@@ -1,0 +1,6 @@
+package com.mosaicql.error;
+
+public enum ErrorCode {
+    PARSE_ERROR, COMPILE_ERROR, EXECUTION_ERROR, SOURCE_ERROR,
+    TYPE_ERROR, FUNCTION_ERROR, RESOURCE_LIMIT
+}
